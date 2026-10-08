@@ -12,16 +12,16 @@ export class SecurityIncidentStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // Resources used to demonstrate least privilege
-    const dataBucket = new s3.Bucket(this, "DeveloperDataBucket", {
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+    // Create example resources to demonstrate least-privilege access.
+    const developerBucket = new s3.Bucket(this, "DeveloperDataBucket", {
       encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });
 
-    const dataTable = new dynamodb.Table(this, "DeveloperDataTable", {
+    const developerTable = new dynamodb.Table(this, "DeveloperDataTable", {
       partitionKey: {
         name: "id",
         type: dynamodb.AttributeType.STRING,
@@ -30,15 +30,17 @@ export class SecurityIncidentStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // Create a restricted developer group.
     const developerGroup = new iam.Group(this, "RestrictedDevelopersGroup", {
       groupName: "SecurityIncidentRestrictedDevelopers",
     });
 
+    // Allow listing the bucket and reading or uploading objects without deleting them.
     developerGroup.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["s3:ListBucket"],
-        resources: [dataBucket.bucketArn],
+        resources: [developerBucket.bucketArn],
       }),
     );
 
@@ -46,10 +48,11 @@ export class SecurityIncidentStack extends cdk.Stack {
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["s3:GetObject", "s3:PutObject"],
-        resources: [dataBucket.arnForObjects("*")],
+        resources: [developerBucket.arnForObjects("*")],
       }),
     );
 
+    // Allow read-only operations on the example DynamoDB table.
     developerGroup.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -60,11 +63,11 @@ export class SecurityIncidentStack extends cdk.Stack {
           "dynamodb:Scan",
           "dynamodb:DescribeTable",
         ],
-        resources: [dataTable.tableArn],
+        resources: [developerTable.tableArn],
       }),
     );
 
-    // Explicitly prevent EC2 access even if another policy allows it.
+    // Explicitly deny EC2 actions for members of this group.
     developerGroup.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.DENY,
@@ -73,7 +76,7 @@ export class SecurityIncidentStack extends cdk.Stack {
       }),
     );
 
-    // Prevent deletion of data in the example resources.
+    // Prevent deletion of objects, buckets, table items, and tables.
     developerGroup.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.DENY,
@@ -84,15 +87,11 @@ export class SecurityIncidentStack extends cdk.Stack {
           "dynamodb:DeleteItem",
           "dynamodb:DeleteTable",
         ],
-        resources: [
-          dataBucket.bucketArn,
-          dataBucket.arnForObjects("*"),
-          dataTable.tableArn,
-        ],
+        resources: ["*"],
       }),
     );
 
-    // CloudTrail: multi-region API auditing
+    // Enable multi-region CloudTrail auditing and send events to CloudWatch Logs.
     const trail = new cloudtrail.Trail(this, "SecurityTrail", {
       isMultiRegionTrail: true,
       includeGlobalServiceEvents: true,
@@ -101,82 +100,134 @@ export class SecurityIncidentStack extends cdk.Stack {
       enableFileValidation: true,
     });
 
-    const trailLogGroup = trail.logGroup;
+    const cloudTrailLogGroup = trail.logGroup;
 
-    if (!trailLogGroup) {
-      throw new Error("CloudTrail must send events to CloudWatch Logs.");
+    if (!cloudTrailLogGroup) {
+      throw new Error("CloudTrail log group was not created.");
     }
 
-    // CloudWatch metric filters and security alarms
-    const iamChangesFilter = new logs.MetricFilter(
+    // Detect IAM policy changes, including changes to group policies.
+    const iamPolicyChanges = new logs.MetricFilter(
       this,
       "IamChangesMetricFilter",
       {
-        logGroup: trailLogGroup,
+        logGroup: cloudTrailLogGroup,
         metricNamespace: "SecurityIncident",
         metricName: "IAMPolicyChanges",
-        metricValue: "1",
         filterPattern: logs.FilterPattern.literal(
           '{ ($.eventSource = "iam.amazonaws.com") && ' +
-            '(($.eventName = "PutUserPolicy") || ' +
-            '($.eventName = "PutRolePolicy") || ' +
-            '($.eventName = "AttachUserPolicy") || ' +
-            '($.eventName = "AttachRolePolicy") || ' +
-            '($.eventName = "CreatePolicyVersion") || ' +
-            '($.eventName = "SetDefaultPolicyVersion")) }',
+            '($.eventName = "PutUserPolicy" || ' +
+            '$.eventName = "PutRolePolicy" || ' +
+            '$.eventName = "PutGroupPolicy" || ' +
+            '$.eventName = "AttachUserPolicy" || ' +
+            '$.eventName = "AttachRolePolicy" || ' +
+            '$.eventName = "AttachGroupPolicy" || ' +
+            '$.eventName = "CreatePolicyVersion" || ' +
+            '$.eventName = "SetDefaultPolicyVersion") }',
         ),
+        metricValue: "1",
       },
     );
 
-    new cloudwatch.Alarm(this, "IamChangesAlarm", {
-      alarmName: "SecurityIncident-IAM-Policy-Changes",
-      alarmDescription:
-        "Detects changes to IAM policies recorded by CloudTrail.",
-      metric: iamChangesFilter.metric({
-        statistic: "Sum",
-        period: cdk.Duration.minutes(5),
-      }),
-      threshold: 1,
-      evaluationPeriods: 1,
-      comparisonOperator:
-        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
+    const iamPolicyChangesAlarm = new cloudwatch.Alarm(
+      this,
+      "IamChangesAlarm",
+      {
+        alarmName: "SecurityIncident-IAM-Policy-Changes",
+        alarmDescription:
+          "Detects changes to IAM policies recorded by CloudTrail.",
+        metric: iamPolicyChanges.metric({
+          statistic: "Sum",
+          period: cdk.Duration.minutes(5),
+        }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      },
+    );
 
-    const ec2ChangesFilter = new logs.MetricFilter(
+    // Detect selected EC2 instance changes.
+    const ec2InstanceChanges = new logs.MetricFilter(
       this,
       "Ec2ChangesMetricFilter",
       {
-        logGroup: trailLogGroup,
+        logGroup: cloudTrailLogGroup,
         metricNamespace: "SecurityIncident",
         metricName: "EC2InstanceChanges",
-        metricValue: "1",
         filterPattern: logs.FilterPattern.literal(
           '{ ($.eventSource = "ec2.amazonaws.com") && ' +
-            '(($.eventName = "ModifyInstanceAttribute") || ' +
-            '($.eventName = "ModifyInstancesAttribute") || ' +
-            '($.eventName = "RunInstances") || ' +
-            '($.eventName = "TerminateInstances")) }',
+            '($.eventName = "ModifyInstanceAttribute" || ' +
+            '$.eventName = "ModifyInstancesAttribute" || ' +
+            '$.eventName = "RunInstances" || ' +
+            '$.eventName = "TerminateInstances") }',
         ),
+        metricValue: "1",
       },
     );
 
-    new cloudwatch.Alarm(this, "Ec2ChangesAlarm", {
-      alarmName: "SecurityIncident-EC2-Changes",
-      alarmDescription:
-        "Detects selected EC2 instance changes recorded by CloudTrail.",
-      metric: ec2ChangesFilter.metric({
-        statistic: "Sum",
-        period: cdk.Duration.minutes(5),
-      }),
-      threshold: 1,
-      evaluationPeriods: 1,
-      comparisonOperator:
-        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
+    const ec2InstanceChangesAlarm = new cloudwatch.Alarm(
+      this,
+      "Ec2ChangesAlarm",
+      {
+        alarmName: "SecurityIncident-EC2-Changes",
+        alarmDescription:
+          "Detects selected EC2 instance changes recorded by CloudTrail.",
+        metric: ec2InstanceChanges.metric({
+          statistic: "Sum",
+          period: cdk.Duration.minutes(5),
+        }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      },
+    );
 
-    // VPC and restricted Security Groups
+    // Detect changes to Security Group ingress and egress rules.
+    const securityGroupChanges = new logs.MetricFilter(
+      this,
+      "SecurityGroupChangesFilter",
+      {
+        logGroup: cloudTrailLogGroup,
+        metricNamespace: "SecurityIncident",
+        metricName: "SecurityGroupChanges",
+        filterPattern: logs.FilterPattern.literal(
+          '{ ($.eventSource = "ec2.amazonaws.com") && ' +
+            '($.eventName = "AuthorizeSecurityGroupIngress" || ' +
+            '$.eventName = "RevokeSecurityGroupIngress" || ' +
+            '$.eventName = "AuthorizeSecurityGroupEgress" || ' +
+            '$.eventName = "RevokeSecurityGroupEgress" || ' +
+            '$.eventName = "ModifySecurityGroupRules" || ' +
+            '$.eventName = "UpdateSecurityGroupRuleDescriptionsIngress" || ' +
+            '$.eventName = "UpdateSecurityGroupRuleDescriptionsEgress") }',
+        ),
+        metricValue: "1",
+      },
+    );
+
+    const securityGroupChangesAlarm = new cloudwatch.Alarm(
+      this,
+      "SecurityGroupChangesAlarm",
+      {
+        alarmName: "SecurityIncident-SecurityGroup-Changes",
+        alarmDescription:
+          "Detects Security Group rule changes recorded by CloudTrail.",
+        metric: securityGroupChanges.metric({
+          statistic: "Sum",
+          period: cdk.Duration.minutes(5),
+        }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      },
+    );
+
+    // Create a VPC without NAT Gateways to avoid unnecessary costs.
     const vpc = new ec2.Vpc(this, "SecurityVpc", {
       maxAzs: 2,
       natGateways: 0,
@@ -188,6 +239,7 @@ export class SecurityIncidentStack extends cdk.Stack {
       ],
     });
 
+    // Create an application Security Group with no public inbound access.
     const applicationSecurityGroup = new ec2.SecurityGroup(
       this,
       "ApplicationSecurityGroup",
@@ -198,6 +250,7 @@ export class SecurityIncidentStack extends cdk.Stack {
       },
     );
 
+    // Create a database Security Group with MySQL access restricted to the application SG.
     const databaseSecurityGroup = new ec2.SecurityGroup(
       this,
       "DatabaseSecurityGroup",
@@ -208,26 +261,23 @@ export class SecurityIncidentStack extends cdk.Stack {
       },
     );
 
-    // MySQL is only allowed from the application Security Group.
+    // Allow MySQL only from the application Security Group.
     databaseSecurityGroup.addIngressRule(
       applicationSecurityGroup,
       ec2.Port.tcp(3306),
       "Allow MySQL from the application Security Group only",
     );
 
-    // No inbound rule allows TCP 22 or public TCP 3306.
-
-    // Outputs
     new cdk.CfnOutput(this, "DeveloperGroupName", {
       value: developerGroup.groupName,
     });
 
     new cdk.CfnOutput(this, "DeveloperDataBucketName", {
-      value: dataBucket.bucketName,
+      value: developerBucket.bucketName,
     });
 
     new cdk.CfnOutput(this, "DeveloperDataTableName", {
-      value: dataTable.tableName,
+      value: developerTable.tableName,
     });
 
     new cdk.CfnOutput(this, "CloudTrailName", {
@@ -235,7 +285,19 @@ export class SecurityIncidentStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, "CloudTrailLogGroupName", {
-      value: trailLogGroup.logGroupName,
+      value: cloudTrailLogGroup.logGroupName,
+    });
+
+    new cdk.CfnOutput(this, "IamPolicyChangesAlarmName", {
+      value: iamPolicyChangesAlarm.alarmName,
+    });
+
+    new cdk.CfnOutput(this, "Ec2InstanceChangesAlarmName", {
+      value: ec2InstanceChangesAlarm.alarmName,
+    });
+
+    new cdk.CfnOutput(this, "SecurityGroupChangesAlarmName", {
+      value: securityGroupChangesAlarm.alarmName,
     });
 
     new cdk.CfnOutput(this, "VpcId", {
